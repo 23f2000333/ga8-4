@@ -305,7 +305,9 @@ def valid_parameter(p):
 
     return (
         isinstance(p["name"], str)
+        and len(p["name"]) > 0
         and isinstance(p["target"], str)
+        and len(p["target"]) > 0
         and positive_safe_int(p["numel"])
     )
 
@@ -395,23 +397,33 @@ def repair(payload):
     params = payload["parameters"]
     allowed = payload["allowedTargets"]
 
-    params_valid = (
-        isinstance(params, list)
-        and all(valid_parameter(p) for p in params)
-        and len({
-            p["name"] for p in params
-        }) == len(params)
+    params_valid = isinstance(params, list) and all(
+        valid_parameter(p) for p in params
     )
 
-    allowed_valid = unique_strings(allowed)
+    if params_valid:
+        names = [p["name"] for p in params]
+        if len(names) != len(set(names)):
+            params_valid = False
+
+    allowed_valid = (
+        isinstance(allowed, list)
+        and len(allowed) > 0
+        and all(isinstance(x, str) and len(x) > 0 for x in allowed)
+        and len(allowed) == len(set(allowed))
+    )
 
     if not params_valid or not allowed_valid:
         reasons.append("INVALID_PARAMETER")
         peft_pass = False
     else:
+        allowed_set = set(allowed)
+
+        # Only parameters whose target is explicitly allowed AND whose name
+        # is a LoRA A/B weight are trainable.
         selected = [
             p for p in params
-            if p["target"] in set(allowed)
+            if p["target"] in allowed_set
             and (
                 p["name"].endswith(".lora_A.weight")
                 or p["name"].endswith(".lora_B.weight")
@@ -423,17 +435,24 @@ def repair(payload):
             peft_pass = False
         else:
             selected.sort(key=lambda p: bkey(p["name"]))
-            trainable_params = [p["name"] for p in selected]
 
-            try:
-                trainable_count = sum(p["numel"] for p in selected)
-                if trainable_count > SAFE_MAX:
-                    raise OverflowError
-            except OverflowError:
+            running_count = 0
+            overflow = False
+
+            for p in selected:
+                if running_count > SAFE_MAX - p["numel"]:
+                    overflow = True
+                    break
+                running_count += p["numel"]
+
+            if overflow:
                 reasons.append("INVALID_PARAMETER")
                 peft_pass = False
                 trainable_params = []
                 trainable_count = 0
+            else:
+                trainable_params = [p["name"] for p in selected]
+                trainable_count = running_count
 
     if payload["inferenceMode"] is not False:
         peft_pass = False
@@ -451,26 +470,35 @@ def repair(payload):
             key=bkey,
         )
 
-        expected = [
+        expected_files = {
             "adapter_config.json",
             "adapter_model.safetensors",
-        ]
+        }
+
+        supplied_set = set(
+            x for x in artifact_files
+            if isinstance(x, str)
+        )
 
         if (
             len(artifact_files) != 2
-            or sorted(artifact_files, key=bkey) != expected
-            or len(set(artifact_files)) != 2
+            or len(supplied_set) != 2
+            or supplied_set != expected_files
         ):
             reasons.append("ADAPTER_FILE_SET")
 
+        # Full-model artifacts are independently disallowed.
+        full_model_names = {
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "model.bin",
+            "model.bin.index.json",
+        }
+
         if any(
-            isinstance(x, str) and (
-                x in {
-                    "pytorch_model.bin",
-                    "model.safetensors",
-                    "model.bin",
-                }
-            )
+            isinstance(x, str) and x in full_model_names
             for x in artifact_files
         ):
             reasons.append("FULL_MODEL_ARTIFACT")
@@ -596,9 +624,7 @@ def repair(payload):
         "templatePass": template_pass,
         "trainableParams": trainable_params,
         "trainableCount": trainable_count,
-        "peftConfigPass": peft_pass and not any(
-            c == "INVALID_PARAMETER" for c in reasons
-        ),
+        "peftConfigPass": peft_pass,
         "adapterFiles": adapter_files,
         "checkpointComplete": checkpoint_complete,
         "lineagePass": lineage_pass,
